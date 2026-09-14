@@ -1,0 +1,240 @@
+name: Build image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # GHCR paths must be lowercase; the repository name is not.
+  IMAGE_NAME: socfortress/opencti-middleware
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        # Linux, so the shared-memory segment-lifetime tests that skip on
+        # macOS are exercised here.
+        run: pytest -q
+
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            slug: amd64
+          # Native arm64 runner rather than QEMU. Emulating a Python image
+          # build takes an order of magnitude longer, and these runners are
+          # free for public repositories.
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            slug: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        # Skipped for pull requests: a fork PR has no write token, and
+        # publishing from unreviewed code would be wrong regardless.
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          # Each architecture is pushed by digest only; the merge job below
+          # assembles them into one multi-arch tag.
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          cache-from: type=gha,scope=${{ matrix.slug }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.slug }}
+          provenance: false
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          # Strip the algorithm prefix in the shell: GitHub Actions
+          # expressions have no parameter-expansion operators.
+          digest="${DIGEST#sha256:}"
+          touch "/tmp/digests/${digest}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - name: Save digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.slug }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish manifest
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
+    steps:
+      - name: Fetch digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.title=OpenCTI Middleware
+            org.opencontainers.image.description=Fast Graylog lookup-table backend for OpenCTI indicator enrichment
+            org.opencontainers.image.licenses=MIT
+
+      - name: Create manifest list
+        id: manifest
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          # One manifest list per tag, assembled from the per-arch digests.
+          # Word splitting is deliberate here: both substitutions have to
+          # expand into separate argv entries (-t tag1 -t tag2 ... ref@sha ...).
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${REGISTRY}/${IMAGE_NAME}@sha256:%s " *)
+          digest=$(docker buildx imagetools inspect \
+            "${REGISTRY}/${IMAGE_NAME}:${TAG}" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ steps.meta.outputs.version }}
+
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+
+      - name: Show what was published
+        run: |
+          docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:${TAG}"
+        env:
+          TAG: ${{ steps.meta.outputs.version }}
+
+  smoke:
+    name: Smoke test published image
+    runs-on: ubuntu-latest
+    needs: merge
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Boot it and check the documented behaviour
+        # There is no OpenCTI to reach here, which is the point: the service
+        # must start, enforce auth, and fail OPEN on lookups rather than
+        # returning 5xx. That is exactly what it promises when upstream is
+        # unreachable, so it is worth asserting on every publish.
+        run: |
+          set -euo pipefail
+          KEY=smoke-test-key-at-least-32-characters
+          docker run -d --name smoke -p 8000:8000 \
+            -e API_KEY="$KEY" \
+            -e OPENCTI_URL=http://127.0.0.1:1 \
+            -e OPENCTI_TOKEN=unused \
+            -e WORKERS=1 -e MEMBERSHIP_MODE=off -e REDIS_ENABLED=false \
+            "${REGISTRY}/${IMAGE_NAME}:sha-${GITHUB_SHA}"
+
+          for _ in $(seq 1 30); do
+            curl -fsS http://localhost:8000/healthz >/dev/null 2>&1 && break
+            sleep 2
+          done
+
+          echo "::group::healthz"
+          curl -fsS http://localhost:8000/healthz; echo
+          echo "::endgroup::"
+
+          echo "--- auth enforced ---"
+          code=$(curl -s -o /dev/null -w '%{http_code}' 'http://localhost:8000/lookup?value=8.8.8.8')
+          [ "$code" = "401" ] || { echo "expected 401, got $code"; docker logs smoke; exit 1; }
+
+          echo "--- fails open when OpenCTI is unreachable ---"
+          body=$(curl -fsS 'http://localhost:8000/lookup?value=8.8.8.8' -H "X-API-Key: $KEY")
+          echo "$body"
+          grep -q '"found":"false"' <<< "$body" || { docker logs smoke; exit 1; }
+
+          echo "--- private IP short-circuits, no upstream call ---"
+          curl -fsS 'http://localhost:8000/lookup?value=10.0.0.1' -H "X-API-Key: $KEY"; echo
+
+          docker rm -f smoke >/dev/null

@@ -9,11 +9,25 @@ majority of a log stream — are answered from process memory in about a
 microsecond and never touch the network.
 
 ```bash
+git clone https://github.com/socfortress/OPENCTI-MIDDLEWARE
+cd OPENCTI-MIDDLEWARE
 cp .env.example .env
 python scripts/gen_token.py     # paste into API_KEY
 $EDITOR .env                    # set OPENCTI_URL and OPENCTI_TOKEN
-docker compose up -d
+docker compose up -d            # pulls a prebuilt image, no build step
 ```
+
+The image is published to GitHub Container Registry for `linux/amd64` and
+`linux/arm64`, so there is nothing to compile locally:
+
+```
+ghcr.io/socfortress/opencti-middleware:latest   # tracks main
+ghcr.io/socfortress/opencti-middleware:1.2.3    # release tags
+ghcr.io/socfortress/opencti-middleware:sha-<commit>
+```
+
+Pin a version or a digest in production — `:latest` moves. To build from
+source instead, comment out `image:` in `compose.yaml` and uncomment `build: .`.
 
 ```console
 $ curl -s 'localhost:8000/lookup?value=212.193.31.122' -H "X-API-Key: $API_KEY"
@@ -414,10 +428,28 @@ Bootstrap takes a few seconds on a small corpus and minutes on a large one.
 ## Development
 
 ```bash
-uv venv && uv pip install -e '.[dev]'
-pytest                # unit + respx-mocked integration
-ruff check . && mypy src
+python -m venv .venv && .venv/bin/pip install -e '.[dev]'
+.venv/bin/pytest                    # unit + respx-mocked integration
+.venv/bin/ruff check . && .venv/bin/mypy src
 ```
+
+Some tests spawn real subprocesses to exercise the cross-worker lock election
+and shared-segment lifetime; those cannot be faked in-process. One test is
+skipped on macOS, where POSIX shared memory is not visible as files under
+`/dev/shm` — CI runs on Linux and covers it.
+
+### Building the image yourself
+
+```bash
+docker build -t opencti-middleware .
+# or multi-arch, as CI does:
+docker buildx build --platform linux/amd64,linux/arm64 -t opencti-middleware .
+```
+
+CI lints, tests, builds both architectures, pushes to GHCR with build
+provenance and an SBOM, then smoke-tests the published image — booting it
+without a reachable OpenCTI and asserting it enforces auth and fails open
+rather than returning 5xx.
 
 ## License
 

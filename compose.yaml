@@ -1,7 +1,12 @@
 services:
   opencti-lookup:
-    build: .
-    image: opencti-lookup:0.1.0
+    # Prebuilt multi-arch image (linux/amd64, linux/arm64) published by CI.
+    # Pin a version or digest in production; :latest tracks main.
+    image: ghcr.io/socfortress/opencti-middleware:${IMAGE_TAG:-latest}
+    pull_policy: always
+    # To build from source instead of pulling, comment out `image` above and
+    # uncomment this:
+    # build: .
     restart: unless-stopped
     env_file: .env
     ports:
