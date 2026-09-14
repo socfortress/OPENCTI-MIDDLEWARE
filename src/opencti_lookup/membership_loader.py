@@ -73,6 +73,7 @@ async def _build_and_publish(
         generation=generation,
         superseded=previous.shm_name if previous else None,
     )
+    report["generation"] = generation
     return LoadedMembership(membership, "builder", report, state_dir)
 
 

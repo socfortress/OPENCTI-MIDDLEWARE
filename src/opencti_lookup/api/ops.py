@@ -42,7 +42,9 @@ async def readyz(request: Request, response: Response) -> dict[str, object]:
     ready = await backend.ready()
     if not ready:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-    return {"ready": ready, **backend.describe(), **_stream_info(request)}
+    reconciler = getattr(request.app.state, "reconciler", None)
+    reconcile = reconciler.stats.describe() if reconciler else {"reconcile": "reader"}
+    return {"ready": ready, **backend.describe(), **_stream_info(request), **reconcile}
 
 
 @router.get("/metrics", summary="Prometheus metrics")

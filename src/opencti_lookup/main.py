@@ -22,6 +22,7 @@ from .indicators import normalize
 from .obs import logging as obs_logging
 from .opencti.client import OpenCTIClient
 from .opencti.stream import StreamConsumer
+from .reconcile import Reconciler
 
 log = structlog.get_logger(__name__)
 
@@ -145,6 +146,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 )
             )
 
+    # --- reconcile (builder only) -----------------------------------------
+    reconciler: Reconciler | None = None
+    reconcile_task: asyncio.Task[None] | None = None
+
+    if (
+        loaded is not None
+        and loaded.role == "builder"
+        and loaded.state_dir is not None
+        and isinstance(backend, SplitBackend)
+    ):
+        reconciler = Reconciler(
+            client=client,
+            settings=settings,
+            state_dir=loaded.state_dir,
+            backend=backend,
+            budget_bytes=membership_bytes,
+            generation=int(loaded.report.get("generation") or 1),
+        )
+        reconcile_task = asyncio.create_task(reconciler.run())
+
+    app.state.reconciler = reconciler
+
     # --- live stream -------------------------------------------------------
     stream: StreamConsumer | None = None
     stream_task: asyncio.Task[None] | None = None
@@ -152,6 +175,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     if settings.stream_enabled and isinstance(backend, SplitBackend):
         watched_backend = backend
+        local_reconciler = reconciler
+
+        def _overlay_full() -> None:
+            # Only the builder can rebuild. A reader hitting its cap has to
+            # wait for the builder's next generation, so say so rather than
+            # warning every event from here on.
+            if local_reconciler is not None:
+                local_reconciler.request("overlay_full")
+            else:
+                log.warning(
+                    "membership.overlay_full",
+                    hint="reader at overlay cap; waiting for the builder's "
+                    "next generation",
+                )
 
         def _norm(value: str) -> str | None:
             parsed = normalize(
@@ -169,10 +206,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             normalize=_norm,
             verify_tls=settings.opencti_verify_tls,
             overlay_full=lambda: watched_backend.membership.overlay_full,
-            on_overlay_full=lambda: log.warning(
-                "membership.overlay_full",
-                hint="rebuild needed to fold pending stream updates back in",
-            ),
+            on_overlay_full=lambda: _overlay_full(),
         )
         stream_task = asyncio.create_task(stream.run())
 
@@ -201,7 +235,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         if stream is not None:
             stream.stop()
-        for task in (stream_task, health_task, retry_task):
+        if reconciler is not None:
+            reconciler.stop()
+        for task in (stream_task, health_task, retry_task, reconcile_task):
             if task is None:
                 continue
             task.cancel()

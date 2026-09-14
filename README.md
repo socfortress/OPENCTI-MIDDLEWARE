@@ -191,6 +191,49 @@ missed heartbeats), the backend marks itself stale and defers to live queries
 until it recovers, because a stale set produces false negatives and those are
 worse than a slow answer.
 
+## Reconcile
+
+The live stream keeps the set current, but two things still drift it:
+
+- **Overlay growth.** Stream updates land in a per-process overlay of Python
+  sets, not in the shared segment. Left alone it grows without bound, and the
+  other workers never see it.
+- **Silent divergence.** A missed event, a stream gap longer than retention,
+  or a bulk change made directly in OpenCTI leaves the set subtly wrong with
+  nothing to signal it. Only a full reload catches that.
+
+So the builder rebuilds on whichever comes first: `MEMBERSHIP_RECONCILE_INTERVAL_S`
+(default 24h), or the overlay crossing `MEMBERSHIP_OVERLAY_MAX`. Only the
+builder reconciles — readers rebuilding independently would defeat sharing one
+segment; a reader that hits its own cap waits for the next generation.
+
+The old segment serves for the entire rebuild. Nothing swaps until the new one
+is complete, and the swap carries the overlay forward, because events that
+arrived mid-rebuild are not in the new snapshot.
+
+Observed with a 45-second interval and three workers:
+
+```
+reconcile.completed  gen=2  4.35s  swept=[]
+membership.generation_adopted  previous=1 adopted=2     (x2 readers)
+reconcile.completed  gen=3  4.46s  swept=['octi_membership_1']
+membership.generation_adopted  previous=2 adopted=3     (x2 readers)
+```
+
+Cleanup lags one generation on purpose: generation 1 is only unlinked once
+everyone has moved to 2 or later, so a reader mid-swap never loses its
+mapping. Requests were served continuously across both cycles.
+
+A failed rebuild increments `reconcile_failures` and leaves the old segment
+serving; the next interval retries.
+
+### Transient memory during a rebuild
+
+Fingerprints accumulate into fixed `numpy` blocks rather than a Python list. A
+list of 50M Python ints is ~1.8 GB against a 400 MB result, and a reconcile
+holds that peak *alongside* both the old and new segments. Chunked, the peak
+is a small multiple of the result instead.
+
 ## Request path
 
 ```

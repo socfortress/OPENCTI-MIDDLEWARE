@@ -44,6 +44,11 @@ import numpy as np
 _DTYPE = np.uint64
 _ITEMSIZE = 8
 
+#: Fingerprints accumulate into fixed numpy blocks rather than a Python list.
+#: A list of 50M Python ints is ~1.8 GB transient against a 400 MB result, and
+#: a reconcile holds that peak alongside both the old and new segments.
+_BUILD_CHUNK = 1 << 16
+
 
 def fingerprint(value: str) -> np.uint64:
     """Stable 64-bit hash. Must not be Python's ``hash()``.
@@ -133,15 +138,27 @@ class MembershipSet:
         than trusting a projected size -- Python memory estimates are
         unreliable enough that the cap has to be applied as we go.
         """
-        seen: list[int] = []
-        for value in values:
-            if max_entries is not None and len(seen) >= max_entries:
-                break
-            seen.append(int(fingerprint(value)))
+        blocks: list[np.ndarray] = []
+        buffer = np.empty(_BUILD_CHUNK, dtype=_DTYPE)
+        filled = 0
 
-        arr = np.array(seen, dtype=_DTYPE)
-        arr.sort()
-        arr = np.unique(arr)
+        for seen, value in enumerate(values):
+            if max_entries is not None and seen >= max_entries:
+                break
+            buffer[filled] = fingerprint(value)
+            filled += 1
+            if filled == _BUILD_CHUNK:
+                blocks.append(buffer)
+                buffer = np.empty(_BUILD_CHUNK, dtype=_DTYPE)
+                filled = 0
+        if filled:
+            blocks.append(buffer[:filled])
+
+        arr = (
+            np.concatenate(blocks) if blocks else np.empty(0, dtype=_DTYPE)
+        )
+        del blocks, buffer
+        arr = np.unique(arr)  # sorts as a side effect
 
         if arr.size == 0:
             return cls(None, 0, owner=True, overlay_max=overlay_max)
