@@ -9,10 +9,17 @@ from __future__ import annotations
 
 from enum import StrEnum
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+#: pydantic-settings JSON-decodes complex types (list/tuple/set) inside the
+#: env source, *before* any field validator runs -- so a plain
+#: "a,b,c" env value raises SettingsError rather than reaching `_split_csv`.
+#: NoDecode turns that off and hands the raw string to the validator.
+CsvTuple = Annotated[tuple[str, ...], NoDecode]
+CsvFrozenSet = Annotated[frozenset[str], NoDecode]
 
 MB = 1024 * 1024
 
@@ -101,7 +108,7 @@ class Settings(BaseSettings):
     hit_policy: HitPolicy = HitPolicy.EXPIRY_AWARE
     min_score: int = 0
     url_hostname_fallback: bool = True
-    domain_match_types: tuple[str, ...] = ("Domain-Name", "Hostname")
+    domain_match_types: CsvTuple = ("Domain-Name", "Hostname")
 
     # ------------------------------------------------------------ resilience
     request_budget_ms: int = 2000
@@ -116,7 +123,7 @@ class Settings(BaseSettings):
 
     # ------------------------------------------------------------ skip lists
     skip_private_ips: bool = True
-    skip_tlds: frozenset[str] = frozenset(
+    skip_tlds: CsvFrozenSet = frozenset(
         {"local", "internal", "lan", "corp", "home", "arpa"}
     )
 
@@ -130,11 +137,26 @@ class Settings(BaseSettings):
             raise ValueError("must start with http:// or https://")
         return v
 
-    @field_validator("skip_tlds", "domain_match_types", mode="before")
+    @field_validator("skip_tlds", mode="before")
     @classmethod
-    def _split_csv(cls, v: object) -> object:
+    def _split_csv_lower(cls, v: object) -> object:
+        """TLDs are compared against a lowercased host, so fold them."""
         if isinstance(v, str):
             return [part.strip().lower() for part in v.split(",") if part.strip()]
+        return v
+
+    @field_validator("domain_match_types", mode="before")
+    @classmethod
+    def _split_csv_preserving_case(cls, v: object) -> object:
+        """OpenCTI entity types keep their configured case.
+
+        7.26 happens to match them case-insensitively, so folding these did no
+        harm there -- but they are spelled Domain-Name / Hostname in the STIX
+        vocabulary, they show up in /config/validate output, and other
+        versions need not be so forgiving.
+        """
+        if isinstance(v, str):
+            return [part.strip() for part in v.split(",") if part.strip()]
         return v
 
     @field_validator("mirror_max_memory_mb", "payload_cache_max_mb", mode="before")
