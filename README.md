@@ -1,0 +1,272 @@
+# OpenCTI Lookup
+
+A Graylog lookup-table backend that answers one question, fast:
+
+> Does this IP, domain, or URL have a live Indicator in OpenCTI?
+
+Built for the volume a Graylog pipeline generates. Misses — the overwhelming
+majority of a log stream — are answered from process memory in about a
+microsecond and never touch the network.
+
+```bash
+cp .env.example .env
+python scripts/gen_token.py     # paste into API_KEY
+$EDITOR .env                    # set OPENCTI_URL and OPENCTI_TOKEN
+docker compose up -d
+```
+
+```console
+$ curl -s 'localhost:8000/lookup?value=212.193.31.122' -H "X-API-Key: $API_KEY"
+{"found":"true","value":"212.193.31.122","type":"IPv4-Addr","match_type":"exact",
+ "score":"20","confidence":"100","expired":"true","labels":"aisuru,iot botnet,ddos attacks",
+ "marking":"TLP:CLEAR","created_by":"AlienVault","opencti_url":"https://…/indicators/da45…"}
+```
+
+---
+
+## Why it's built this way
+
+A lookup asks two questions with wildly different costs:
+
+| Question | Cost per indicator |
+|---|---|
+| Is this value in OpenCTI at all? | **8 bytes** |
+| What are its score, labels, marking, validity? | ~250 bytes |
+
+Around **99% of a log stream is misses**, and a miss is answered entirely by
+the first question. So only the cheap structure has to cover the whole corpus.
+The expensive one is an ordinary bounded cache, filled on demand — you never
+need payloads for 50M indicators, only for the few thousand your logs touch.
+
+**Membership set** — one 64-bit hash per indicator in a sorted array backed by
+shared memory. Eight bytes each, *one copy regardless of worker count*:
+
+| Corpus | Membership set | Full payload mirror |
+|---|---|---|
+| 17,767 | 140 KB | 4 MB |
+| 1,000,000 | 8 MB | 250 MB |
+| 10,000,000 | **80 MB** | 2.5 GB |
+| 50,000,000 | **400 MB** | 12.5 GB |
+
+There is no corpus size at which misses stop being fast.
+
+### What that buys
+
+| | Miss (~99%) | Hit, warm | Hit, cold | OpenCTI down |
+|---|---|---|---|---|
+| Naive proxy | 330 ms | 50 µs | 361 ms | everything reads as a miss |
+| Full mirror | 10 µs | 10 µs | 10 µs | fine until the corpus outgrows RAM |
+| **This** | **~1 µs** | 50 µs | 361 ms once | **misses perfect, hits report `found` without enrichment** |
+
+That last column is the one the other two can't reach: with OpenCTI
+unreachable this still alerts correctly, it just can't enrich.
+
+### Memory safety
+
+**A miss allocates nothing.** It's answered from a fixed-size array and never
+reaches a cache. A proxy design has to cache misses, and the miss keyspace is
+unbounded — a scanner throwing random domains at you grows that cache without
+limit. Here, unbounded miss traffic costs zero memory, permanently.
+
+The payload cache is bounded three ways at once:
+
+- **TTL** (24 h) — only a backstop; the live stream invalidates changed
+  indicators precisely. If the stream goes unhealthy the TTL drops to a floor.
+- **LRU maxsize** — derived from a byte budget, not set independently.
+- **Max entry size** (1 KB, enforced by truncation) — this is what makes the
+  ceiling real. `TTLCache(maxsize=N)` counts *entries, not bytes*; one
+  indicator carrying 400 labels would otherwise blow the budget.
+
+Redis gets `maxmemory` + `allkeys-lru` in `compose.yaml`. Default Redis has no
+limit and will consume the box.
+
+---
+
+## Request path
+
+```
+  GET /lookup?value=…
+       │
+  0 ── normalize + reject     ~5 µs   RFC1918, .local, .internal — never cached, never queried
+  1 ── membership set         ~1 µs   sorted uint64 in shared memory  ◄── ~99% exit here
+  2 ── payload cache         ~50 µs   byte-bounded TTL + LRU
+  3 ── single-flight                  N concurrent lookups of one value → 1 upstream call
+  4 ── OpenCTI GraphQL     ~361 ms    pooled keep-alive, bounded concurrency, circuit breaker
+```
+
+Tier 4 is measured against a live OpenCTI 7.26 instance (median of six cold
+queries, 326–394 ms). A *miss* upstream costs about the same as a hit, which
+is why tiers 0 and 1 matter so much.
+
+---
+
+## Hit semantics
+
+A hit requires a **curated Indicator**, not merely an observable — observables
+get created as side effects of report ingest and aren't a verdict. The service
+matches the observable on its exact indexed `value`, then traverses to the
+Indicators linked to it, in one GraphQL round trip.
+
+### `HIT_POLICY`
+
+Measured on OpenCTI 7.26: **`revoked` is set automatically when `valid_until`
+passes.** Cross-tabulating a real 17,767-indicator corpus gives zeros on both
+off-diagonals — the revoked and expired sets are *identical*:
+
+| | `valid_until` future | `valid_until` past |
+|---|---|---|
+| `revoked = false` | 16,212 | **0** |
+| `revoked = true` | **0** | 1,555 |
+
+So "exclude revoked" and "keep expired" cancel out unless you discriminate on
+*why* something was revoked:
+
+| Policy | Counts as a hit |
+|---|---|
+| `live_only` | Only `revoked = false`. Strictest. |
+| `expiry_aware` *(default)* | Everything except human retractions — `revoked` while still inside the validity window. Expired still hits, flagged `expired: "true"`. |
+| `all` | Every indicator; the pipeline rule filters. |
+
+On a corpus with no manual revocations, `expiry_aware` and `all` behave
+identically, and the real choice is `live_only` (drop the expired) versus
+everything else (drop nothing).
+
+### Domains are stored under two types
+
+Measured: `Domain-Name` 8,124 and `Hostname` 2,867. A lookup filtering only on
+`Domain-Name` silently misses ~26% of the domain corpus, so both are queried.
+Controlled by `DOMAIN_MATCH_TYPES`.
+
+### URLs
+
+OpenCTI stores `Url` observables as exact strings, so a logged URL with a query
+string rarely matches. The service tries the normalized URL, then falls back to
+its hostname, and reports which fired via `match_type` (`exact` / `hostname`).
+
+### Normalization
+
+Runs ahead of every cache so `HXXP://Evil.COM/a/` and `http://evil.com/a` are
+one cache key and one query, not two of each.
+
+- Defang `hxxp→http`, `[.]→.`, `[:]→:`; strip wrapping brackets and quotes
+- IPs reduced via `ipaddress` — `010.1.1.1`, `::1` and `0:0:…:1` collapse to
+  one key. Zero-padded octets are canonicalized first, since `ipaddress`
+  rejects them as ambiguously octal and they're a real evasion form
+- Domains lowercased, trailing dot stripped, IDNA-encoded to punycode
+- URLs: scheme and host lowercased, fragment dropped, default ports dropped,
+  path and query left byte-exact
+- Private/loopback/link-local/reserved IPs and non-public TLDs return
+  `found: "false"` in microseconds without touching a cache or the network
+
+---
+
+## API
+
+| Endpoint | Method | Purpose | Auth |
+|---|---|---|---|
+| `/lookup?value=` | GET | The one Graylog calls | API key |
+| `/lookup/bulk` | POST | Batch; for backfills and testing | API key |
+| `/healthz` | GET | Liveness; never touches OpenCTI | none |
+| `/readyz` | GET | Config valid, backend loaded, breaker closed | none |
+| `/metrics` | GET | Prometheus | none |
+| `/config/validate` | GET | Deployment aid; live-tests OpenCTI | API key |
+
+Responses are **flat, all strings, no nulls, no arrays, no nesting** — Graylog
+pipeline rules mishandle all four. Enforced by the serializer, not convention.
+
+- Hit → `{"found": "true", …}`
+- Miss → `{"found": "false"}` at **HTTP 200**, never 404. Graylog's
+  HTTPJSONPath adapter treats non-2xx as an adapter error, and misses are the
+  common case
+- Upstream down → `{"found": "false", "degraded": "true"}`, still 200
+
+---
+
+## Graylog setup
+
+### Data adapter (HTTP JSONPath)
+
+| Setting | Value |
+|---|---|
+| Lookup URL | `http://opencti-lookup:8000/lookup?value=${key}` |
+| Single value JSONPath | `$.found` |
+| Multi value JSONPath | `$` |
+| HTTP headers | `X-API-Key: <token>` |
+
+**Exactly one query parameter.** Graylog URL-encodes the whole substituted key,
+so a second parameter arrives glued onto the value as `%26customer_code%3D…`.
+Tenant tags travel as the `X-Customer-Code` header instead.
+
+### Cache — configure this
+
+Set the lookup table's cache to **Guava Cache**, ~20,000 entries, 60 s TTL.
+It sits in front of this service and is free; a large share of lookups then
+never leave Graylog at all.
+
+### Pipeline rules
+
+```java
+// Stage 1 — enrich. set_fields() takes the whole map, so adding a response
+// field never means editing this rule.
+rule "OpenCTI :: enrich destination_ip"
+when
+    has_field("destination_ip")
+then
+    let ioc = lookup("opencti_indicators", to_string($message.destination_ip));
+    set_fields(fields: ioc, prefix: "threat_intel_");
+end
+```
+
+```java
+// Stage 2 — decide. Non-expired hits alert; expired hits stay as context.
+rule "OpenCTI :: flag live indicator"
+when
+    to_string($message.threat_intel_found)   == "true" &&
+    to_string($message.threat_intel_expired) == "false"
+then
+    set_field("alert", true);
+    set_field("alert_source", "OpenCTI");
+    set_field("alert_severity", to_string($message.threat_intel_score));
+end
+```
+
+---
+
+## Configuration
+
+Everything via `.env` — see [`.env.example`](.env.example) for the annotated
+list. Required: `API_KEY`, `OPENCTI_URL`, `OPENCTI_TOKEN`. The service refuses
+to boot on a bad config with one message naming every problem.
+
+A few worth knowing about:
+
+- **`WORKERS`** — start at `min(cpu_count, 4)`. The familiar `cpu*2+1` is the
+  formula for *synchronous* workers and is wrong here; more workers means more
+  fragmented payload caches and a lower hit rate.
+- **`MEMBERSHIP_SOURCE`** — `observables` (default) reads values directly at
+  ~4,500/sec; `indicators` walks the indicator→observable relationship at
+  ~210/sec for exactness. The fast path's false positives self-correct (an
+  observable with no indicator triggers a payload query that returns a miss),
+  so switch only if observables greatly outnumber indicators. The ratio is
+  logged at startup and warned on above 3:1.
+- **Memory autodetection** reads the **cgroup** limit before host RAM. Under
+  Docker those differ, and only the cgroup number avoids the OOM killer.
+  It sets a *default*, logged loudly at startup; `MIRROR_MAX_MEMORY_MB` and
+  `PAYLOAD_CACHE_MAX_MB` override it.
+
+Bootstrap takes a few seconds on a small corpus and minutes on a large one.
+`/readyz` stays false until it completes, so orchestration won't route early.
+
+---
+
+## Development
+
+```bash
+uv venv && uv pip install -e '.[dev]'
+pytest                # unit + respx-mocked integration
+ruff check . && mypy src
+```
+
+## License
+
+MIT
