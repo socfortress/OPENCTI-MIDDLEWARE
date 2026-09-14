@@ -1,0 +1,32 @@
+<!--
+  Add inside <ossec_config> in /var/ossec/etc/ossec.conf, then:
+      systemctl restart wazuh-manager
+
+  hook_url  the middleware base URL (a trailing /lookup is also accepted)
+  api_key   the middleware API_KEY, sent as X-API-Key
+  group     which rule groups trigger a lookup
+
+  Scope this deliberately. The integration spawns a process per matching
+  alert, so a broad <level> or no filter at all is the difference between a
+  handful of lookups a second and thousands.
+-->
+<integration>
+  <name>custom-opencti</name>
+  <hook_url>http://opencti-middleware:8000</hook_url>
+  <api_key>REPLACE_WITH_YOUR_API_KEY</api_key>
+  <alert_format>json</alert_format>
+  <group>sysmon_event3,sysmon_event1,sysmon_event6,sysmon_event7,sysmon_event_15,sysmon_event_22,syscheck,ids,web</group>
+</integration>
+
+<!--
+  Alternative: filter by level rather than group. Level 3 is very broad on a
+  busy manager; start higher and widen once you have measured the rate.
+
+  <integration>
+    <name>custom-opencti</name>
+    <hook_url>http://opencti-middleware:8000</hook_url>
+    <api_key>REPLACE_WITH_YOUR_API_KEY</api_key>
+    <alert_format>json</alert_format>
+    <level>7</level>
+  </integration>
+-->

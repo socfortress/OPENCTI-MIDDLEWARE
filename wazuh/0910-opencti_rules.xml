@@ -1,0 +1,72 @@
+<!--
+  Local rules for the OpenCTI middleware integration.
+
+  Install as /var/ossec/etc/rules/0910-opencti_rules.xml
+  (chown wazuh:wazuh, chmod 660), then restart wazuh-manager.
+
+  The integration only writes back on a hit, so every event reaching these
+  rules is already a confirmed indicator match. Severity is driven by the
+  OpenCTI score and whether the indicator is still inside its validity window.
+-->
+<group name="opencti,threat_intel,">
+
+  <!-- Parent. Never alerts on its own; level 0 keeps it out of the console. -->
+  <rule id="100910" level="0">
+    <decoded_as>json</decoded_as>
+    <field name="integration">^opencti$</field>
+    <description>OpenCTI middleware integration event</description>
+    <options>no_full_log</options>
+  </rule>
+
+  <rule id="100911" level="8">
+    <if_sid>100910</if_sid>
+    <field name="opencti.found">^true$</field>
+    <description>OpenCTI: indicator match on $(opencti.indicator)</description>
+    <mitre>
+      <id>T1071</id>
+    </mitre>
+    <options>no_full_log</options>
+  </rule>
+
+  <!-- Expired intel is kept as context rather than paged on. Matches the
+       HIT_POLICY=expiry_aware default, where an indicator past valid_until
+       is still returned but flagged. -->
+  <rule id="100912" level="4">
+    <if_sid>100911</if_sid>
+    <field name="opencti.expired">^true$</field>
+    <description>OpenCTI: EXPIRED indicator match on $(opencti.indicator)</description>
+    <options>no_full_log</options>
+  </rule>
+
+  <rule id="100913" level="10">
+    <if_sid>100911</if_sid>
+    <field name="opencti.expired">^false$</field>
+    <field name="opencti.score">^([5-9][0-9]|100)$</field>
+    <description>OpenCTI: high-confidence indicator $(opencti.indicator) (score $(opencti.score))</description>
+    <mitre>
+      <id>T1071</id>
+    </mitre>
+    <options>no_full_log</options>
+  </rule>
+
+  <rule id="100914" level="12">
+    <if_sid>100913</if_sid>
+    <field name="opencti.labels">c2|command-and-control|ransomware|apt</field>
+    <description>OpenCTI: $(opencti.indicator) matches high-severity intel ($(opencti.labels))</description>
+    <mitre>
+      <id>T1071</id>
+      <id>T1486</id>
+    </mitre>
+    <options>no_full_log</options>
+  </rule>
+
+  <!-- A hostname-only URL match is weaker: the exact URL was not in OpenCTI,
+       only its host. Surfaced, but not at the same level. -->
+  <rule id="100915" level="5">
+    <if_sid>100911</if_sid>
+    <field name="opencti.match_type">^hostname$</field>
+    <description>OpenCTI: host of $(opencti.indicator) is known, exact URL is not</description>
+    <options>no_full_log</options>
+  </rule>
+
+</group>

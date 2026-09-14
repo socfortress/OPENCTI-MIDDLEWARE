@@ -358,6 +358,19 @@ pipeline rules mishandle all four. Enforced by the serializer, not convention.
 
 ---
 
+## Two ways in
+
+| Path | Use it for |
+|---|---|
+| **[Graylog lookup tables](docs/graylog-setup.md)** | High-volume streams. No process spawn; Graylog's own cache absorbs repeats. |
+| **[Wazuh integration](docs/wazuh.md)** | Targeted enrichment inside Wazuh's correlation — FIM hashes, specific rule groups. |
+
+Both can run at once. Note the Wazuh manager spawns a **process per matching
+alert** — measured at ~73 ms each, ~44 ms of which is interpreter startup, so
+roughly 14 alerts/sec per analysisd thread. That ceiling is the spawn, not the
+lookup, so scope the `<integration>` filter tightly and send bulk traffic
+through Graylog.
+
 ## Graylog setup
 
 ### Data adapter (HTTP JSONPath)
