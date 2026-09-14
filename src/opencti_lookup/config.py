@@ -73,6 +73,13 @@ class Settings(BaseSettings):
     membership_stale_after_s: int = 900
     membership_reconcile_interval_s: int = 86_400
     membership_overlay_max: int = 50_000
+    # Cross-worker sharing: one worker bootstraps and publishes the segment
+    # name; the rest attach to it. Without this every uvicorn worker builds
+    # its own copy -- N times the OpenCTI load and N copies of the segment.
+    membership_shared: bool = True
+    membership_state_dir: str = ""          # "" -> /dev/shm or the temp dir
+    membership_attach_timeout_s: int = 300  # must exceed bootstrap time
+    membership_attach_retry_s: int = 30     # background re-attach after a timeout
 
     # --------------------------------------------------------- memory budget
     mirror_max_memory_mb: int | Literal["auto"] = "auto"
@@ -140,6 +147,22 @@ class Settings(BaseSettings):
         return self
 
     # -------------------------------------------------------------- derived
+
+    @property
+    def state_dir(self) -> str:
+        """Where the lock and state file live.
+
+        /dev/shm is tmpfs on Linux and sits next to the segments themselves;
+        it does not exist on macOS, so fall back to the temp dir there.
+        """
+        if self.membership_state_dir:
+            return self.membership_state_dir
+        import tempfile
+        from pathlib import Path
+
+        shm = Path("/dev/shm")  # noqa: S108 - the POSIX shm mount, not a temp dir
+        base = shm if shm.is_dir() else Path(tempfile.gettempdir())
+        return str(base / "opencti-lookup")
 
     @property
     def graphql_url(self) -> str:

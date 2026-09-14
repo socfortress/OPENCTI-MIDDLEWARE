@@ -58,6 +58,20 @@ class SplitBackend:
     def membership(self) -> MembershipSet:
         return self._membership
 
+    def swap_membership(self, membership: MembershipSet, *, ready: bool = True) -> None:
+        """Replace the membership set in place.
+
+        Used when a worker attaches after an initial timeout, and by the
+        rebuild path when a new generation is published. The old set is
+        closed only if this process owned it -- a reader must never unlink a
+        segment other workers are still mapping.
+        """
+        previous = self._membership
+        self._membership = membership
+        self._ready = ready
+        if previous is not membership:
+            previous.close(unlink=False)
+
     async def lookup(self, value: Normalized) -> LookupResult:
         if not value.lookupable:
             return LookupResult(MISS, "skip")

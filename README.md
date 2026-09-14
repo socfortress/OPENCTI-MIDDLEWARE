@@ -39,7 +39,8 @@ The expensive one is an ordinary bounded cache, filled on demand — you never
 need payloads for 50M indicators, only for the few thousand your logs touch.
 
 **Membership set** — one 64-bit hash per indicator in a sorted array backed by
-shared memory. Eight bytes each, *one copy regardless of worker count*:
+shared memory. Eight bytes each, and genuinely *one copy regardless of worker
+count* (see [Cross-worker sharing](#cross-worker-sharing)):
 
 | Corpus | Membership set | Full payload mirror |
 |---|---|---|
@@ -81,6 +82,57 @@ Redis gets `maxmemory` + `allkeys-lru` in `compose.yaml`. Default Redis has no
 limit and will consume the box.
 
 ---
+
+## Cross-worker sharing
+
+`uvicorn --workers N` runs the lifespan in each worker independently. Left
+alone that means N bootstraps against OpenCTI at startup and N copies of the
+segment — at 50M indicators, 400 MB *per worker* instead of 400 MB total,
+which defeats the point of using shared memory.
+
+Workers elect a builder with a file lock:
+
+1. Each worker tries `flock(LOCK_EX | LOCK_NB)` on `<state_dir>/membership.lock`.
+2. The winner bootstraps, then atomically publishes `{shm_name, count,
+   generation}` to `membership.json`.
+3. The losers poll for that file and attach to the named segment.
+4. A loser that times out serves via the live backend and keeps retrying,
+   rather than building its own and reintroducing the N-copies problem.
+
+Verified with four workers against a live instance: **1 bootstrap, 3 attaches,
+one 142 KB segment.**
+
+### Three things this has to get right
+
+**A reader exiting must not destroy the segment.** CPython registers every
+`SharedMemory` a process touches — including ones it only *attached* to — and
+unlinks them when that process exits ([bpo-38119][]). Confirmed on 3.14: one
+reader exiting destroyed the builder's segment. `attach()` unregisters from
+the `resource_tracker`, so the builder alone owns the lifecycle.
+
+**A rebuild must land in a new segment.** If the builder dies, its lock
+releases and the respawned worker becomes the new builder. It publishes
+`generation + 1` under a new name, because readers may still be mapping the
+old one.
+
+**The sweep must not unlink a live segment.** Stale-segment cleanup keeps both
+the currently-published generation and the one being built. Unlinking a mapped
+segment does not break existing readers — POSIX keeps the mapping alive — but
+it does mean the next worker to start cannot attach and silently rebuilds.
+
+Readers watch the state file and adopt a higher generation when one appears,
+so a builder failover propagates without a restart:
+
+```
+membership.published        gen=2 shm=octi_membership_2 superseded=octi_membership_1
+membership.generation_adopted  previous=1 adopted=2
+membership.generation_adopted  previous=1 adopted=2
+membership.generation_adopted  previous=1 adopted=2
+```
+
+Set `MEMBERSHIP_SHARED=false` to opt out and give every worker its own copy.
+
+[bpo-38119]: https://github.com/python/cpython/issues/82300
 
 ## Request path
 

@@ -104,7 +104,11 @@ async def iter_values(
 
 
 async def build_membership(
-    client: OpenCTIClient, settings: Settings, *, max_entries: int | None = None
+    client: OpenCTIClient,
+    settings: Settings,
+    *,
+    max_entries: int | None = None,
+    name: str | None = None,
 ) -> tuple[MembershipSet, dict[str, object]]:
     """Bootstrap the membership set. Returns the set plus a report for logs."""
     started = time.perf_counter()
@@ -132,7 +136,10 @@ async def build_membership(
             break
 
     membership = MembershipSet.build(
-        values, overlay_max=settings.membership_overlay_max, max_entries=max_entries
+        values,
+        name=name,
+        overlay_max=settings.membership_overlay_max,
+        max_entries=max_entries,
     )
     elapsed = time.perf_counter() - started
 

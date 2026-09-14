@@ -32,6 +32,7 @@ grow without limit.
 from __future__ import annotations
 
 import bisect
+import contextlib
 import hashlib
 import threading
 from collections.abc import Iterable, Iterator
@@ -154,8 +155,17 @@ class MembershipSet:
 
     @classmethod
     def attach(cls, name: str, count: int, *, overlay_max: int = 50_000) -> MembershipSet:
-        """Map a segment built by another process. Read-only usage."""
+        """Map a segment built by another process. Read-only usage.
+
+        Detaches the segment from this process's ``resource_tracker`` first.
+        CPython registers every SharedMemory a process touches -- including
+        ones it merely attached to -- and unlinks them when that process
+        exits (bpo-38119). Verified on 3.14: one reader exiting destroys the
+        builder's segment for every other worker. Since the builder owns the
+        lifecycle here, readers must not be tracked.
+        """
         shm = shared_memory.SharedMemory(name=name, create=False)
+        _untrack(shm)
         return cls(shm, count, owner=False, overlay_max=overlay_max)
 
     @classmethod
@@ -240,6 +250,18 @@ class MembershipSet:
             pass
         finally:
             self._shm = None
+
+
+def _untrack(shm: shared_memory.SharedMemory) -> None:
+    """Remove a segment from this process's resource_tracker registry.
+
+    Without this a reader's exit unlinks the segment out from under every
+    other worker. See MembershipSet.attach.
+    """
+    with contextlib.suppress(Exception):
+        from multiprocessing import resource_tracker
+
+        resource_tracker.unregister(f"/{shm.name}", "shared_memory")
 
 
 def estimate_bytes(count: int) -> int:

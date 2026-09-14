@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from collections.abc import AsyncIterator
 
 import structlog
 from fastapi import FastAPI
 
+from . import membership_loader
 from . import memory as memory_mod
 from .api import lookup as lookup_routes
 from .api import ops as ops_routes
 from .backends.live import LiveBackend
-from .backends.membership import MembershipSet, estimate_bytes
+from .backends.membership import MembershipSet
 from .backends.split import SplitBackend
-from .bootstrap import build_membership, count_observables
 from .cache.payload import PayloadCache
 from .config import Settings, get_settings
 from .obs import logging as obs_logging
@@ -86,46 +87,83 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     backend: object = live
     membership: MembershipSet | None = None
+    loaded: membership_loader.LoadedMembership | None = None
+    retry_task: asyncio.Task[None] | None = None
 
     if settings.membership_mode != "off":
-        max_entries = membership_bytes // 8 if membership_bytes else 0
         try:
-            corpus = await count_observables(client)
-            projected = estimate_bytes(corpus)
-            affordable = projected <= membership_bytes or settings.membership_mode == "always"
-            log.info(
-                "membership.sizing",
-                corpus=corpus,
-                projected_bytes=projected,
-                budget_bytes=membership_bytes,
-                affordable=affordable,
+            loaded = await membership_loader.load(
+                client, settings, budget_bytes=membership_bytes
             )
-            if affordable:
-                membership, report = await build_membership(
-                    client, settings, max_entries=max_entries or None
-                )
-                split = SplitBackend(membership=membership, live=live, settings=settings)
-                split.mark_ready(True)
-                backend = split
-                app.state.bootstrap_report = report
-            else:
-                log.warning(
-                    "membership.skipped_too_large",
-                    corpus=corpus, projected_bytes=projected, budget_bytes=membership_bytes,
-                )
         except Exception as exc:
-            log.warning("membership.bootstrap_failed", error=str(exc))
+            log.warning("membership.load_failed", error=str(exc))
+            loaded = None
+
+        if loaded is not None and loaded.membership is not None:
+            membership = loaded.membership
+            split = SplitBackend(membership=membership, live=live, settings=settings)
+            split.mark_ready(True)
+            backend = split
+            app.state.bootstrap_report = loaded.report
+            app.state.membership_role = loaded.role
+        elif loaded is not None and loaded.state_dir is not None:
+            # Attach timed out. Serve via the live backend meanwhile -- building
+            # our own here would reintroduce the N-copies problem this exists
+            # to prevent -- and pick up the segment when it appears.
+            split = SplitBackend(
+                membership=MembershipSet.empty(), live=live, settings=settings
+            )
+            backend = split
+            app.state.membership_role = "attaching"
+
+        # Readers follow the published generation: if the builder dies and is
+        # replaced, the replacement publishes a NEW segment, and without this
+        # every existing reader stays pinned to the old data forever.
+        if (
+            loaded is not None
+            and loaded.state_dir is not None
+            and loaded.role != "builder"
+            and isinstance(backend, SplitBackend)
+        ):
+            watched = backend
+
+            def _adopt(new_membership: MembershipSet) -> None:
+                watched.swap_membership(new_membership)
+                app.state.membership = new_membership
+                app.state.membership_role = "reader"
+
+            retry_task = asyncio.create_task(
+                membership_loader.watch_for_new_generation(
+                    loaded.state_dir,
+                    settings,
+                    _adopt,
+                    current_generation=int(
+                        loaded.report.get("attached_generation") or 0
+                    ),
+                )
+            )
 
     app.state.backend = backend
     app.state.membership = membership
-    log.info("startup.complete", backend=backend.describe())  # type: ignore[attr-defined]
+    log.info(
+        "startup.complete",
+        role=getattr(app.state, "membership_role", "none"),
+        backend=backend.describe(),  # type: ignore[attr-defined]
+    )
 
     try:
         yield
     finally:
+        if retry_task is not None:
+            retry_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await retry_task
         await client.aclose()
-        if membership is not None:
-            membership.close()
+        current: MembershipSet | None = getattr(app.state, "membership", membership)
+        if current is not None:
+            current.close()
+        if loaded is not None and loaded.state_dir is not None:
+            loaded.state_dir.release_builder()
         log.info("shutdown.complete")
 
 
