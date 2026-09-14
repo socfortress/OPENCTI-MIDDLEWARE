@@ -194,6 +194,8 @@ jobs:
       contents: read
       packages: read
     steps:
+      - uses: actions/checkout@v4
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -201,23 +203,42 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Boot it and check the documented behaviour
-        # There is no OpenCTI to reach here, which is the point: the service
+      - name: Boot it the way a new user would
+        # Deliberately boots from the shipped .env.example rather than
+        # individual -e flags. A published image once crash-looped because
+        # .env.example sets CSV values that pydantic-settings could not parse,
+        # and a flag-based smoke test sailed straight past it: the env file is
+        # the first thing a real deployment touches, so it is what gets tested.
+        #
+        # There is no OpenCTI to reach, which is also the point: the service
         # must start, enforce auth, and fail OPEN on lookups rather than
-        # returning 5xx. That is exactly what it promises when upstream is
-        # unreachable, so it is worth asserting on every publish.
+        # returning 5xx -- exactly what it promises when upstream is down.
         run: |
           set -euo pipefail
           KEY=smoke-test-key-at-least-32-characters
-          docker run -d --name smoke -p 8000:8000 \
-            -e API_KEY="$KEY" \
-            -e OPENCTI_URL=http://127.0.0.1:1 \
-            -e OPENCTI_TOKEN=unused \
-            -e WORKERS=1 -e MEMBERSHIP_MODE=off -e REDIS_ENABLED=false \
+          cp .env.example smoke.env
+          sed -i \
+            -e "s|^API_KEY=$|API_KEY=${KEY}|" \
+            -e "s|^OPENCTI_TOKEN=$|OPENCTI_TOKEN=unused|" \
+            -e "s|^OPENCTI_URL=.*|OPENCTI_URL=http://127.0.0.1:1|" \
+            -e "s|^WORKERS=.*|WORKERS=1|" \
+            -e "s|^MEMBERSHIP_MODE=.*|MEMBERSHIP_MODE=off|" \
+            -e "s|^REDIS_ENABLED=.*|REDIS_ENABLED=false|" \
+            smoke.env
+          echo "::group::effective env"
+          grep -vE '^\s*#|^\s*$' smoke.env
+          echo "::endgroup::"
+
+          docker run -d --name smoke -p 8000:8000 --env-file smoke.env \
             "${REGISTRY}/${IMAGE_NAME}:sha-${GITHUB_SHA}"
 
           for _ in $(seq 1 30); do
             curl -fsS http://localhost:8000/healthz >/dev/null 2>&1 && break
+            # A crash-looping container never becomes healthy; surface why
+            # rather than timing out with an empty curl error.
+            if [ "$(docker inspect -f '{{.State.Running}}' smoke)" != "true" ]; then
+              echo "container exited during startup:"; docker logs smoke; exit 1
+            fi
             sleep 2
           done
 
