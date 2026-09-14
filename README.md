@@ -134,6 +134,63 @@ Set `MEMBERSHIP_SHARED=false` to opt out and give every worker its own copy.
 
 [bpo-38119]: https://github.com/python/cpython/issues/82300
 
+## Live stream
+
+Without it the membership set is a boot-time snapshot: correct at startup and
+drifting afterwards, with new intel invisible until the next rebuild. The
+consumer subscribes to OpenCTI's SSE stream and applies changes as they land.
+
+An **indicator** event carries its observable values inline, under
+`extensions[].observable_values`, so keeping the set current costs **no extra
+GraphQL calls**:
+
+```
+event: update
+id: 1789313330953-0
+data: {"data": {"type": "indicator",
+                "extensions": {"extension-definition--ea279b3e": {
+                    "observable_values": [{"type": "Url", "value": "http://…/deploy_silent1.Ps1"}]}}}}
+```
+
+Observable events (`ipv4-addr`, `ipv6-addr`, `domain-name`, `url`, `hostname`)
+carry a plain `value`. Everything else — vocabularies, relationships,
+external references — is skipped; measured against a live replay, **143 of
+1,137 events** were relevant.
+
+The `id` is a Redis stream id and doubles as the resume cursor: reconnecting
+with `?from=<id>` replays everything after it, so a dropped connection loses
+no events within the stream's retention. Reconnects back off with jitter so N
+workers don't thunder against OpenCTI in lockstep.
+
+Every worker runs its own consumer. One shared consumer would not work: the
+overlay it writes into is per-process Python state, not part of the shared
+mapping. SSE connections are cheap and all workers converge.
+
+### Quiet is not the same as dead
+
+OpenCTI emits `heartbeat` events roughly every 6 seconds, plus
+`consumer_metrics` carrying its own `timeLag`. That distinction matters more
+than it looks: staleness is keyed on **activity** — heartbeats included —
+never on when an indicator last changed.
+
+Keying it on event recency would mark a perfectly healthy service stale on any
+quiet night and drop it to slow live queries for no reason. Observed on the
+idle test instance:
+
+| | Value | Meaning |
+|---|---|---|
+| `stream_activity_lag_s` | 3.6 | heartbeats arriving — connection alive |
+| `stream_event_lag_s` | 94.0 | nothing changed in OpenCTI for 94s |
+| `stale` | `false` | correct |
+
+Heartbeats also advance the resume cursor, so an idle connection doesn't
+replay history when it reconnects.
+
+When the stream *does* stall (`STREAM_STALE_AFTER_S`, default 120s — twenty
+missed heartbeats), the backend marks itself stale and defers to live queries
+until it recovers, because a stale set produces false negatives and those are
+worse than a slow answer.
+
 ## Request path
 
 ```

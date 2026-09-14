@@ -29,6 +29,7 @@ import structlog
 
 from .backends.membership import MembershipSet, estimate_bytes
 from .config import Settings
+from .indicators import normalize
 from .opencti.client import OpenCTIClient
 from .opencti.queries import (
     BOOTSTRAP_INDICATORS,
@@ -74,9 +75,25 @@ async def _iter_page(
 
 
 async def iter_values(
-    client: OpenCTIClient, settings: Settings, *, limit: int | None = None
+    client: OpenCTIClient,
+    settings: Settings,
+    *,
+    limit: int | None = None,
+    raw: bool = False,
 ) -> AsyncIterator[str]:
-    """Yield the observable values that should populate the membership set."""
+    """Yield the observable values that should populate the membership set.
+
+    Values are normalized with the same function the lookup path uses, because
+    the set is keyed on the normalized form. Inserting OpenCTI's raw strings
+    instead makes every value whose normalized form differs a permanent false
+    miss -- measured at 1.5% of a real corpus, mostly URLs.
+
+    Values that can never be looked up (email addresses, crypto wallets,
+    filenames, private IPs) are dropped rather than stored: on the same corpus
+    they were 27.7% of entries, all of it dead weight.
+
+    ``raw=True`` disables both, for diagnostics.
+    """
     precise = settings.membership_source == "indicators"
     query = BOOTSTRAP_INDICATORS if precise else BOOTSTRAP_OBSERVABLES
     root = "indicators" if precise else "stixCyberObservables"
@@ -97,7 +114,17 @@ async def iter_values(
             for value in values:
                 if not value:
                     continue
-                yield value
+                if raw:
+                    yield value
+                else:
+                    parsed = normalize(
+                        value,
+                        skip_private=settings.skip_private_ips,
+                        skip_tlds=settings.skip_tlds,
+                    )
+                    if not parsed.lookupable:
+                        continue
+                    yield parsed.value
                 emitted += 1
                 if limit is not None and emitted >= limit:
                     return

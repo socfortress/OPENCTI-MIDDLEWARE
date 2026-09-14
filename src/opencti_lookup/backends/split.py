@@ -47,6 +47,19 @@ class SplitBackend:
     def mark_ready(self, ready: bool = True) -> None:
         self._ready = ready
 
+    def stream_health(
+        self, *, connected: bool, activity_lag_s: float, stale_after_s: int
+    ) -> None:
+        """Fold live-stream health into staleness.
+
+        Keyed on *activity* (heartbeats included), never on when an indicator
+        last changed. OpenCTI heartbeats every ~6s, so silence past the
+        threshold means the connection has stalled. Using event recency here
+        instead would mark a healthy service stale on any quiet night and
+        drop it to slow live queries for no reason.
+        """
+        self.mark_stale(not connected or activity_lag_s > stale_after_s)
+
     def mark_stale(self, stale: bool) -> None:
         """Stream lag past the threshold -- stop trusting the membership set."""
         if stale != self._stale:
@@ -67,6 +80,10 @@ class SplitBackend:
         segment other workers are still mapping.
         """
         previous = self._membership
+        if previous is not membership:
+            # The new segment was built from a snapshot that may predate
+            # events already in the old overlay; carry them over.
+            membership.adopt_overlay(previous)
         self._membership = membership
         self._ready = ready
         if previous is not membership:

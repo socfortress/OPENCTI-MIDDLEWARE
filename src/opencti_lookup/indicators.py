@@ -44,6 +44,31 @@ DEFAULT_SKIP_TLDS: frozenset[str] = frozenset(
     {"local", "internal", "lan", "corp", "home", "arpa", "localdomain", "test", "invalid"}
 )
 
+#: A filename has exactly the shape of a domain -- "WMIC.exe" and "R34DM3.txt"
+#: both satisfy the domain regex. OpenCTI carries these as StixFile
+#: observables, and Graylog sends them in process-execution events. Without
+#: this they classify as domains and generate lookups that can never hit.
+#: Not a substitute for a public-suffix list, just the cheap 90%.
+#:
+#: Deliberately EXCLUDES extensions that are also real TLDs, because a false
+#: negative on a domain is far worse than a wasted lookup on a file:
+#:   com  legacy DOS executable, and the most common TLD there is
+#:   zip  archive, and a real gTLD -- and a known phishing vector, so the
+#:        domain reading is the one that matters for threat intel
+#:   py   Python source, and Paraguay
+#:   mov  video, and a real gTLD
+#:   sh   shell script, and Saint Helena
+FILE_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        "exe", "dll", "sys", "bat", "cmd", "ps1", "vbs", "js", "jar", "msi",
+        "scr", "bin", "dat", "tmp", "log", "txt", "doc", "docx", "xls",
+        "xlsx", "ppt", "pptx", "pdf", "rtf", "rar", "7z", "gz", "tar",
+        "iso", "img", "png", "jpg", "jpeg", "gif", "bmp", "svg", "mp3", "mp4",
+        "avi", "lnk", "url", "hta", "chm", "reg", "conf", "ini", "xml", "json",
+        "csv", "sql", "bak", "php", "asp", "aspx", "jsp",
+    }
+)
+
 _DEFANG = (
     ("[.]", "."), ("(.)", "."), ("{.}", "."), (" dot ", "."),
     ("[:]", ":"), ("[/]", "/"), ("[@]", "@"), ("[at]", "@"),
@@ -164,9 +189,13 @@ def _normalize_url(raw: str) -> tuple[str, str] | None:
         netloc = f"{host}:{port}"
 
     # Path and query stay byte-exact -- they are case- and order-significant
-    # upstream, and OpenCTI stores the URL as an opaque string.
+    # upstream, and OpenCTI stores the URL as an opaque string it matches on
+    # equality. Notably an empty path stays empty: forcing a trailing slash
+    # made "http://x.com" (as stored) unmatchable by "http://x.com/" (as
+    # normalized). Measured against the live corpus, that alone accounted for
+    # most of a 1.5% false-miss rate.
     normalized = urlunsplit(
-        (parts.scheme.lower(), netloc, parts.path or "/", parts.query, "")
+        (parts.scheme.lower(), netloc, parts.path, parts.query, "")
     )
     return normalized, host
 
@@ -219,6 +248,8 @@ def normalize(
         tld = host.rsplit(".", 1)[-1]
         if tld in skip_tlds:
             return Normalized(raw, host, IndicatorType.DOMAIN, "skipped_tld")
+        if tld in FILE_EXTENSIONS:
+            return Normalized(raw, host, IndicatorType.UNKNOWN, "looks_like_filename")
         return Normalized(raw, host, IndicatorType.DOMAIN)
 
     return Normalized(raw, cleaned, IndicatorType.UNKNOWN, "unclassified")

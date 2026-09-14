@@ -205,6 +205,19 @@ class MembershipSet:
             self._added.discard(fp)
             self._tombstones.add(fp)
 
+    def adopt_overlay(self, other: MembershipSet) -> None:
+        """Carry another set's pending stream updates onto this one.
+
+        Used when swapping to a newly published generation. The rebuild
+        snapshot may predate events already applied to the old overlay, so
+        dropping it would lose those updates for the length of the bootstrap.
+        Re-applying entries the new segment already contains is harmless.
+        """
+        with self._lock:
+            self._added |= other._added
+            self._tombstones |= other._tombstones
+            self._added -= other._tombstones
+
     @property
     def overlay_full(self) -> bool:
         """True when the overlay has grown enough to warrant a rebuild."""

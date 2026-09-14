@@ -77,6 +77,13 @@ class Settings(BaseSettings):
     # name; the rest attach to it. Without this every uvicorn worker builds
     # its own copy -- N times the OpenCTI load and N copies of the segment.
     membership_shared: bool = True
+    # SSE live stream keeps the membership set current between rebuilds.
+    # Each worker runs its own consumer: the overlay it writes into is
+    # per-process Python state, not part of the shared mapping.
+    stream_enabled: bool = True
+    # OpenCTI heartbeats roughly every 6s, so silence this long means the
+    # connection stalled rather than the instance being quiet.
+    stream_stale_after_s: int = 120
     membership_state_dir: str = ""          # "" -> /dev/shm or the temp dir
     membership_attach_timeout_s: int = 300  # must exceed bootstrap time
     membership_attach_retry_s: int = 30     # background re-attach after a timeout

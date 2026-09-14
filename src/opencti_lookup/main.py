@@ -18,8 +18,10 @@ from .backends.membership import MembershipSet
 from .backends.split import SplitBackend
 from .cache.payload import PayloadCache
 from .config import Settings, get_settings
+from .indicators import normalize
 from .obs import logging as obs_logging
 from .opencti.client import OpenCTIClient
+from .opencti.stream import StreamConsumer
 
 log = structlog.get_logger(__name__)
 
@@ -143,6 +145,49 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 )
             )
 
+    # --- live stream -------------------------------------------------------
+    stream: StreamConsumer | None = None
+    stream_task: asyncio.Task[None] | None = None
+    health_task: asyncio.Task[None] | None = None
+
+    if settings.stream_enabled and isinstance(backend, SplitBackend):
+        watched_backend = backend
+
+        def _norm(value: str) -> str | None:
+            parsed = normalize(
+                value,
+                skip_private=settings.skip_private_ips,
+                skip_tlds=settings.skip_tlds,
+            )
+            return parsed.value if parsed.lookupable else None
+
+        stream = StreamConsumer(
+            url=settings.stream_url,
+            token=settings.opencti_token.get_secret_value(),
+            on_add=lambda v: watched_backend.membership.add(v),
+            on_remove=lambda v: watched_backend.membership.remove(v),
+            normalize=_norm,
+            verify_tls=settings.opencti_verify_tls,
+            overlay_full=lambda: watched_backend.membership.overlay_full,
+            on_overlay_full=lambda: log.warning(
+                "membership.overlay_full",
+                hint="rebuild needed to fold pending stream updates back in",
+            ),
+        )
+        stream_task = asyncio.create_task(stream.run())
+
+        async def _watch_stream_health() -> None:
+            while True:
+                await asyncio.sleep(30)
+                watched_backend.stream_health(
+                    connected=stream.stats.connected,  # type: ignore[union-attr]
+                    activity_lag_s=stream.stats.activity_lag_s,  # type: ignore[union-attr]
+                    stale_after_s=settings.stream_stale_after_s,
+                )
+
+        health_task = asyncio.create_task(_watch_stream_health())
+
+    app.state.stream = stream
     app.state.backend = backend
     app.state.membership = membership
     log.info(
@@ -154,10 +199,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        if retry_task is not None:
-            retry_task.cancel()
+        if stream is not None:
+            stream.stop()
+        for task in (stream_task, health_task, retry_task):
+            if task is None:
+                continue
+            task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await retry_task
+                await task
         await client.aclose()
         current: MembershipSet | None = getattr(app.state, "membership", membership)
         if current is not None:

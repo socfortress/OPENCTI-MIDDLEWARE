@@ -53,6 +53,20 @@ MEMBERSHIP_LAG = Gauge(
     registry=REGISTRY,
 )
 
+STREAM_CONNECTED = Gauge(
+    "opencti_stream_connected",
+    "1 when the SSE live stream is connected, 0 otherwise.",
+    registry=REGISTRY,
+)
+STREAM_EVENTS = Gauge(
+    "opencti_stream_events_applied_total",
+    "Live-stream events that changed the membership set.",
+    registry=REGISTRY,
+)
+STREAM_RECONNECTS = Gauge(
+    "opencti_stream_reconnects_total", "SSE reconnects.", registry=REGISTRY
+)
+
 CACHE_ENTRIES = Gauge(
     "opencti_payload_cache_entries", "Entries in the payload cache.", registry=REGISTRY
 )
