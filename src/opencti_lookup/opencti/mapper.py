@@ -166,6 +166,11 @@ def build_payload(
     labels = _labels(survivors)
     fields["labels"] = ",".join(labels) or None
 
+    # Analyst convenience, carried over from the app this replaces.
+    vt = _virustotal_url(indicator_type, value)
+    if vt:
+        fields["virustotal_url"] = vt
+
     indicator_id = primary.get("id")
     if indicator_id:
         fields["opencti_url"] = (
@@ -174,6 +179,16 @@ def build_payload(
 
     # Omit rather than null -- Graylog pipeline rules choke on nulls.
     return {k: v for k, v in fields.items() if v is not None}
+
+
+def _virustotal_url(indicator_type: str, value: str) -> str | None:
+    if indicator_type.startswith("StixFile"):
+        return f"https://www.virustotal.com/gui/file/{value}"
+    if indicator_type in ("IPv4-Addr", "IPv6-Addr"):
+        return f"https://www.virustotal.com/gui/ip-address/{value}"
+    if indicator_type in ("Domain-Name", "Hostname"):
+        return f"https://www.virustotal.com/gui/domain/{value}"
+    return None
 
 
 MISS: dict[str, str] = {"found": "false"}

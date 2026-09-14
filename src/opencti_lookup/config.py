@@ -204,6 +204,10 @@ class Settings(BaseSettings):
     def query_types_for(self, indicator_type: str) -> tuple[str, ...]:
         if indicator_type == "Domain-Name":
             return self.domain_match_types
+        if indicator_type.startswith("StixFile"):
+            # All three hash flavours share one OpenCTI entity type; the
+            # algorithm is carried by the filter key, not the type.
+            return ("StixFile",)
         return (indicator_type,)
 
 

@@ -18,6 +18,7 @@ query IndicatorLookup($filters: FilterGroup!, $types: [String]) {
       observable_value
       x_opencti_score
       objectMarking { definition }
+      ... on StixFile { name hashes { algorithm hash } }
       indicators { edges { node {
         id
         name
@@ -86,12 +87,26 @@ query Health { about { version } }
 """
 
 
-def value_filter(value: str) -> dict[str, Any]:
-    """Exact match on the indexed `value` field of an observable."""
+def _eq(key: str, value: str) -> dict[str, Any]:
     return {
         "mode": "and",
         "filterGroups": [],
-        "filters": [
-            {"key": "value", "operator": "eq", "values": [value], "mode": "or"}
-        ],
+        "filters": [{"key": key, "operator": "eq", "values": [value], "mode": "or"}],
     }
+
+
+def value_filter(value: str) -> dict[str, Any]:
+    """Exact match on the indexed `value` field of an observable."""
+    return _eq("value", value)
+
+
+def hash_filter(algorithm: str, digest: str) -> dict[str, Any]:
+    """Exact match on a file hash.
+
+    File hashes are NOT reachable through the `value` filter even though
+    `observable_value` displays the digest -- verified on a live 7.26
+    instance, where filtering StixFile by `value` returns nothing for a hash
+    that `hashes.SHA-256` matches. The algorithm is spelled MD5 / SHA-1 /
+    SHA-256.
+    """
+    return _eq(f"hashes.{algorithm}", digest)

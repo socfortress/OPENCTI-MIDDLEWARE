@@ -15,7 +15,7 @@ from ..config import Settings
 from ..indicators import IndicatorType, Normalized, url_hostname
 from ..opencti.client import BreakerOpenError, OpenCTIClient, OpenCTIError
 from ..opencti.mapper import DEGRADED, MISS, build_payload
-from ..opencti.queries import LOOKUP, value_filter
+from ..opencti.queries import LOOKUP, hash_filter, value_filter
 from .base import LookupResult, Payload
 
 log = structlog.get_logger(__name__)
@@ -82,10 +82,14 @@ class LiveBackend:
     async def _query(
         self, value: str, kind: IndicatorType, *, match_type: str
     ) -> Payload | None:
+        algorithm = kind.hash_algorithm
+        filters = (
+            hash_filter(algorithm, value) if algorithm else value_filter(value)
+        )
         data = await self._client.execute(
             LOOKUP,
             {
-                "filters": value_filter(value),
+                "filters": filters,
                 "types": list(self._settings.query_types_for(kind.value)),
             },
         )

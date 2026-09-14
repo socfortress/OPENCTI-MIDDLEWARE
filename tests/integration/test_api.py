@@ -171,3 +171,24 @@ def test_customer_code_travels_as_a_header(client: TestClient) -> None:
 
 def test_healthz_needs_no_auth(client: TestClient) -> None:
     assert client.get("/healthz").json() == {"status": "ok"}
+
+
+@respx.mock
+def test_hash_lookup_uses_the_hashes_filter_key(client: TestClient) -> None:
+    """A StixFile is not reachable by `value`; it needs hashes.<ALGO>."""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        variables = json.loads(request.content)["variables"]
+        seen.append(variables)
+        return gql(EMPTY)
+
+    respx.post(GRAPHQL).mock(side_effect=handler)
+    sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    client.get(f"/lookup?value={sha256}", headers=AUTH)
+
+    assert seen[0]["types"] == ["StixFile"]
+    assert seen[0]["filters"]["filters"][0]["key"] == "hashes.SHA-256"
+    assert seen[0]["filters"]["filters"][0]["values"] == [sha256]

@@ -2,7 +2,7 @@
 
 A Graylog lookup-table backend that answers one question, fast:
 
-> Does this IP, domain, or URL have a live Indicator in OpenCTI?
+> Does this IP, domain, URL, or file hash have a live Indicator in OpenCTI?
 
 Built for the volume a Graylog pipeline generates. Misses — the overwhelming
 majority of a log stream — are answered from process memory in about a
@@ -297,6 +297,15 @@ On a corpus with no manual revocations, `expiry_aware` and `all` behave
 identically, and the real choice is `live_only` (drop the expired) versus
 everything else (drop nothing).
 
+### File hashes take a different filter key
+
+MD5, SHA-1 and SHA-256 are detected by length and resolve against `StixFile`
+observables. These are **not** reachable through the `value` filter that every
+other indicator uses — filtering a StixFile by `value` returns nothing even
+though `observable_value` displays the digest. They need `hashes.MD5`,
+`hashes.SHA-1` or `hashes.SHA-256`. Digests are case-folded, since Sysmon
+emits uppercase and OpenCTI stores lowercase.
+
 ### Domains are stored under two types
 
 Measured: `Domain-Name` 8,124 and `Hostname` 2,867. A lookup filtering only on
@@ -321,6 +330,7 @@ one cache key and one query, not two of each.
 - Domains lowercased, trailing dot stripped, IDNA-encoded to punycode
 - URLs: scheme and host lowercased, fragment dropped, default ports dropped,
   path and query left byte-exact
+- File hashes are folded to lowercase and matched by length (32/40/64 hex)
 - Private/loopback/link-local/reserved IPs and non-public TLDs return
   `found: "false"` in microseconds without touching a cache or the network
 

@@ -25,7 +25,44 @@ class IndicatorType(StrEnum):
     IPV6 = "IPv6-Addr"
     DOMAIN = "Domain-Name"
     URL = "Url"
+    # File hashes all live on StixFile observables and are matched by a
+    # `hashes.<ALGO>` filter key rather than by `value`, so they are separate
+    # members here even though they share one OpenCTI entity type.
+    HASH_MD5 = "StixFile:MD5"
+    HASH_SHA1 = "StixFile:SHA-1"
+    HASH_SHA256 = "StixFile:SHA-256"
     UNKNOWN = "Unknown"
+
+    @property
+    def is_hash(self) -> bool:
+        return self in _HASH_TYPES
+
+    @property
+    def hash_algorithm(self) -> str | None:
+        """OpenCTI's spelling of the algorithm, for the filter key."""
+        return _HASH_ALGORITHMS.get(self)
+
+
+_HASH_TYPES = frozenset(
+    {IndicatorType.HASH_MD5, IndicatorType.HASH_SHA1, IndicatorType.HASH_SHA256}
+)
+
+#: Exactly as OpenCTI spells them in `hashes.<ALGO>` filter keys -- verified
+#: against a live 7.26 instance, where `hashes.SHA-256` matches and a plain
+#: `value` filter on the same hash returns nothing.
+_HASH_ALGORITHMS: dict[IndicatorType, str] = {
+    IndicatorType.HASH_MD5: "MD5",
+    IndicatorType.HASH_SHA1: "SHA-1",
+    IndicatorType.HASH_SHA256: "SHA-256",
+}
+
+_HASH_BY_LENGTH: dict[int, IndicatorType] = {
+    32: IndicatorType.HASH_MD5,
+    40: IndicatorType.HASH_SHA1,
+    64: IndicatorType.HASH_SHA256,
+}
+
+_HEX_RE = re.compile(r"^[a-fA-F0-9]+$")
 
 
 #: A domain arriving from Graylog may be stored under either type in OpenCTI.
@@ -38,6 +75,9 @@ QUERY_TYPES: dict[IndicatorType, tuple[str, ...]] = {
     IndicatorType.IPV6: ("IPv6-Addr",),
     IndicatorType.DOMAIN: DOMAIN_QUERY_TYPES,
     IndicatorType.URL: ("Url",),
+    IndicatorType.HASH_MD5: ("StixFile",),
+    IndicatorType.HASH_SHA1: ("StixFile",),
+    IndicatorType.HASH_SHA256: ("StixFile",),
 }
 
 DEFAULT_SKIP_TLDS: frozenset[str] = frozenset(
@@ -230,6 +270,13 @@ def normalize(
         kind = IndicatorType.IPV4 if ip.version == 4 else IndicatorType.IPV6
         reason = _is_skippable_ip(ip) if skip_private else None
         return Normalized(raw, _normalize_ip(ip), kind, reason)
+
+    # --- File hash: fixed-length hex, no separators ---
+    # Checked before URL/domain because a bare hex string matches neither and
+    # would otherwise end up UNKNOWN.
+    hash_type = _HASH_BY_LENGTH.get(len(cleaned))
+    if hash_type is not None and _HEX_RE.match(cleaned):
+        return Normalized(raw, cleaned.lower(), hash_type)
 
     # --- URL: anything carrying a scheme, a path, or a query ---
     if "://" in cleaned or "/" in cleaned or "?" in cleaned:
