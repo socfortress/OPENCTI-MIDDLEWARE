@@ -188,6 +188,21 @@ Every worker runs its own consumer. One shared consumer would not work: the
 overlay it writes into is per-process Python state, not part of the shared
 mapping. SSE connections are cheap and all workers converge.
 
+### Generic or named stream
+
+By default the consumer reads OpenCTI's generic `/stream`, which OpenCTI only
+serves to `BYPASS` users. Setting `OPENCTI_STREAM_ID` switches it to a named
+live stream, `/stream/<id>`. A stream filtered to Indicators is enough: every
+event the consumer acts on is an indicator event carrying its observable
+values. Creates and deletes arrive in the same format on both, verified on
+7.26.
+
+OpenCTI refuses a stream with a 401 and puts the reason only in the HTTP status
+line, with an empty body. The consumer checks the status before it reports
+`connected` and keeps that reason in `stream_error`. Otherwise all it would
+see is a content-type mismatch. Setup is in the README under
+[Running without an admin token](../README.md#running-without-an-admin-token).
+
 ### Quiet is not the same as dead
 
 OpenCTI emits `heartbeat` events roughly every 6 seconds, plus
