@@ -120,7 +120,10 @@ class SplitBackend:
 
     def describe(self) -> dict[str, object]:
         stats = self._membership.stats()
+        # Live first: it reports "backend": "live", which would otherwise
+        # overwrite ours and make /readyz claim live-only while split serves.
         return {
+            **self._live.describe(),
             "backend": "split",
             "ready": self._ready,
             "stale": self._stale,
@@ -129,5 +132,4 @@ class SplitBackend:
             "membership_tombstoned": stats.tombstoned,
             "membership_effective": stats.effective,
             "membership_bytes": stats.bytes_shared,
-            **self._live.describe(),
         }

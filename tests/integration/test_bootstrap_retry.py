@@ -108,6 +108,7 @@ def test_failed_first_load_is_not_ready_and_answers_live(settings: Settings) -> 
         r = c.get("/readyz")
         assert r.status_code == 503
         assert r.json()["membership_role"] == "bootstrapping"
+        assert r.json()["backend"] == "split"
 
         # Lookups still work -- they go live and fail open while it's down.
         body = c.get("/lookup?value=8.8.8.8", headers=AUTH).json()

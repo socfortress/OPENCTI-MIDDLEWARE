@@ -25,6 +25,13 @@ import structlog
 log = structlog.get_logger(__name__)
 
 
+def _detail(exc: Exception) -> str:
+    """httpx raises timeouts (and some connect errors) with an empty message,
+    which logged as `error='timeout: '`. Fall back to the class name, which
+    also says which phase failed: ConnectTimeout vs ReadTimeout."""
+    return str(exc) or type(exc).__name__
+
+
 class OpenCTIError(RuntimeError):
     """Upstream failed in a way the caller should treat as "no answer"."""
 
@@ -154,14 +161,14 @@ class OpenCTIClient:
                     if attempt + 1 < attempts:
                         await asyncio.sleep(0.05)
                         continue
-                    await self._fail(f"connect: {exc}")
-                    raise OpenCTIError(f"connect failed: {exc}") from exc
+                    await self._fail(f"connect: {_detail(exc)}")
+                    raise OpenCTIError(f"connect failed: {_detail(exc)}") from exc
                 except httpx.TimeoutException as exc:
-                    await self._fail(f"timeout: {exc}")
-                    raise OpenCTIError(f"timeout: {exc}") from exc
+                    await self._fail(f"timeout: {_detail(exc)}")
+                    raise OpenCTIError(f"timeout: {_detail(exc)}") from exc
                 except httpx.HTTPError as exc:
-                    await self._fail(f"http: {exc}")
-                    raise OpenCTIError(f"http error: {exc}") from exc
+                    await self._fail(f"http: {_detail(exc)}")
+                    raise OpenCTIError(f"http error: {_detail(exc)}") from exc
 
                 if response.status_code != 200:
                     await self._fail(f"status {response.status_code}")
