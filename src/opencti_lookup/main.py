@@ -91,90 +91,93 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     backend: object = live
     membership: MembershipSet | None = None
     loaded: membership_loader.LoadedMembership | None = None
-    retry_task: asyncio.Task[None] | None = None
+    reconciler: Reconciler | None = None
+    stream: StreamConsumer | None = None
+    tasks: list[asyncio.Task[None]] = []
 
+    app.state.backend = backend
+    app.state.membership = None
+    app.state.reconciler = None
+    app.state.stream = None
+
+    # With membership on, this is the backend from the start. Until a set is
+    # swapped in it is not ready: every lookup defers to live and /readyz
+    # reports 503, so a failed first load is visible rather than silent.
+    pending: SplitBackend | None = None
     if settings.membership_mode != "off":
-        try:
-            loaded = await membership_loader.load(
-                client, settings, budget_bytes=membership_bytes
-            )
-        except Exception as exc:
-            log.warning("membership.load_failed", error=str(exc))
-            loaded = None
+        pending = SplitBackend(
+            membership=MembershipSet.empty(), live=live, settings=settings
+        )
 
-        if loaded is not None and loaded.membership is not None:
-            membership = loaded.membership
-            split = SplitBackend(membership=membership, live=live, settings=settings)
-            split.mark_ready(True)
-            backend = split
-            app.state.bootstrap_report = loaded.report
-            app.state.membership_role = loaded.role
-        elif loaded is not None and loaded.state_dir is not None:
+    def _activate(
+        target: SplitBackend, result: membership_loader.LoadedMembership
+    ) -> None:
+        """Wire up a completed load: inline at boot, or later from the retry."""
+        nonlocal backend, membership, loaded, reconciler, stream
+        loaded = result
+
+        if result.membership is not None:
+            membership = result.membership
+            target.swap_membership(membership)
+            backend = target
+            app.state.bootstrap_report = result.report
+            app.state.membership_role = result.role
+        elif result.state_dir is not None:
             # Attach timed out. Serve via the live backend meanwhile -- building
             # our own here would reintroduce the N-copies problem this exists
             # to prevent -- and pick up the segment when it appears.
-            split = SplitBackend(
-                membership=MembershipSet.empty(), live=live, settings=settings
-            )
-            backend = split
+            backend = target
             app.state.membership_role = "attaching"
+        else:
+            # Corpus too large for the budget: the live backend is the service.
+            backend = live
+            app.state.membership_role = "none"
+
+        app.state.backend = backend
+        app.state.membership = membership
+        if not isinstance(backend, SplitBackend):
+            return
+        split = backend
 
         # Readers follow the published generation: if the builder dies and is
         # replaced, the replacement publishes a NEW segment, and without this
         # every existing reader stays pinned to the old data forever.
-        if (
-            loaded is not None
-            and loaded.state_dir is not None
-            and loaded.role != "builder"
-            and isinstance(backend, SplitBackend)
-        ):
-            watched = backend
+        if result.state_dir is not None and result.role != "builder":
 
             def _adopt(new_membership: MembershipSet) -> None:
-                watched.swap_membership(new_membership)
+                split.swap_membership(new_membership)
                 app.state.membership = new_membership
                 app.state.membership_role = "reader"
 
-            retry_task = asyncio.create_task(
-                membership_loader.watch_for_new_generation(
-                    loaded.state_dir,
-                    settings,
-                    _adopt,
-                    current_generation=int(
-                        loaded.report.get("attached_generation") or 0
-                    ),
+            tasks.append(
+                asyncio.create_task(
+                    membership_loader.watch_for_new_generation(
+                        result.state_dir,
+                        settings,
+                        _adopt,
+                        current_generation=int(
+                            result.report.get("attached_generation") or 0
+                        ),
+                    )
                 )
             )
 
-    # --- reconcile (builder only) -----------------------------------------
-    reconciler: Reconciler | None = None
-    reconcile_task: asyncio.Task[None] | None = None
+        # --- reconcile (builder only) -------------------------------------
+        if result.role == "builder" and result.state_dir is not None:
+            reconciler = Reconciler(
+                client=client,
+                settings=settings,
+                state_dir=result.state_dir,
+                backend=split,
+                budget_bytes=membership_bytes,
+                generation=int(result.report.get("generation") or 1),
+            )
+            tasks.append(asyncio.create_task(reconciler.run()))
+            app.state.reconciler = reconciler
 
-    if (
-        loaded is not None
-        and loaded.role == "builder"
-        and loaded.state_dir is not None
-        and isinstance(backend, SplitBackend)
-    ):
-        reconciler = Reconciler(
-            client=client,
-            settings=settings,
-            state_dir=loaded.state_dir,
-            backend=backend,
-            budget_bytes=membership_bytes,
-            generation=int(loaded.report.get("generation") or 1),
-        )
-        reconcile_task = asyncio.create_task(reconciler.run())
-
-    app.state.reconciler = reconciler
-
-    # --- live stream -------------------------------------------------------
-    stream: StreamConsumer | None = None
-    stream_task: asyncio.Task[None] | None = None
-    health_task: asyncio.Task[None] | None = None
-
-    if settings.stream_enabled and isinstance(backend, SplitBackend):
-        watched_backend = backend
+        # --- live stream ---------------------------------------------------
+        if not settings.stream_enabled:
+            return
         local_reconciler = reconciler
 
         def _overlay_full() -> None:
@@ -198,32 +201,77 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             return parsed.value if parsed.lookupable else None
 
-        stream = StreamConsumer(
+        consumer = StreamConsumer(
             url=settings.stream_url,
             token=settings.opencti_token.get_secret_value(),
-            on_add=lambda v: watched_backend.membership.add(v),
-            on_remove=lambda v: watched_backend.membership.remove(v),
+            on_add=lambda v: split.membership.add(v),
+            on_remove=lambda v: split.membership.remove(v),
             normalize=_norm,
             verify_tls=settings.opencti_verify_tls,
-            overlay_full=lambda: watched_backend.membership.overlay_full,
+            overlay_full=lambda: split.membership.overlay_full,
             on_overlay_full=lambda: _overlay_full(),
         )
-        stream_task = asyncio.create_task(stream.run())
+        stream = consumer
+        app.state.stream = consumer
+        tasks.append(asyncio.create_task(consumer.run()))
 
         async def _watch_stream_health() -> None:
             while True:
                 await asyncio.sleep(30)
-                watched_backend.stream_health(
-                    connected=stream.stats.connected,  # type: ignore[union-attr]
-                    activity_lag_s=stream.stats.activity_lag_s,  # type: ignore[union-attr]
+                split.stream_health(
+                    connected=consumer.stats.connected,
+                    activity_lag_s=consumer.stats.activity_lag_s,
                     stale_after_s=settings.stream_stale_after_s,
                 )
 
-        health_task = asyncio.create_task(_watch_stream_health())
+        tasks.append(asyncio.create_task(_watch_stream_health()))
 
-    app.state.stream = stream
-    app.state.backend = backend
-    app.state.membership = membership
+    async def _retry_bootstrap(
+        target: SplitBackend, attempt: int, delay: float
+    ) -> None:
+        # The reconciler only exists once a load has succeeded, so nothing
+        # else would ever pick this up -- the process would stay live-only
+        # until restarted.
+        while True:
+            await asyncio.sleep(delay)
+            attempt += 1
+            try:
+                result = await membership_loader.load(
+                    client, settings, budget_bytes=membership_bytes
+                )
+            except Exception as exc:
+                delay = min(delay * 2, settings.membership_bootstrap_retry_max_s)
+                log.warning(
+                    "membership.load_failed",
+                    attempt=attempt,
+                    retry_in_s=delay,
+                    error=str(exc),
+                )
+                continue
+            log.info("membership.load_recovered", attempt=attempt)
+            _activate(target, result)
+            return
+
+    if pending is not None:
+        try:
+            first = await membership_loader.load(
+                client, settings, budget_bytes=membership_bytes
+            )
+        except Exception as exc:
+            delay = min(
+                settings.membership_bootstrap_retry_s,
+                settings.membership_bootstrap_retry_max_s,
+            )
+            log.warning(
+                "membership.load_failed", attempt=1, retry_in_s=delay, error=str(exc)
+            )
+            backend = pending
+            app.state.backend = pending
+            app.state.membership_role = "bootstrapping"
+            tasks.append(asyncio.create_task(_retry_bootstrap(pending, 1, delay)))
+        else:
+            _activate(pending, first)
+
     log.info(
         "startup.complete",
         role=getattr(app.state, "membership_role", "none"),
@@ -237,9 +285,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             stream.stop()
         if reconciler is not None:
             reconciler.stop()
-        for task in (stream_task, health_task, retry_task, reconcile_task):
-            if task is None:
-                continue
+        for task in list(tasks):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
