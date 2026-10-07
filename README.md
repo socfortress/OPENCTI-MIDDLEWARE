@@ -383,6 +383,39 @@ A few settings are worth understanding before you tune anything:
 | `MIRROR_MAX_MEMORY_MB` | `auto` | Autodetection reads the **cgroup** limit before host RAM. Under Docker those differ, and only the cgroup number avoids the OOM killer. The resolved budget is logged loudly at startup. |
 | `DOMAIN_MATCH_TYPES` | `Domain-Name,Hostname` | Both, because OpenCTI stores domains under both types. Dropping `Hostname` silently loses ~26% of a real domain corpus. |
 | `STREAM_ENABLED` | `true` | The SSE live stream. Turn it off and the membership set becomes a boot-time snapshot that drifts. |
+| `OPENCTI_STREAM_ID` | *(empty)* | Consume a named live stream instead of the generic one. Required unless `OPENCTI_TOKEN` belongs to a BYPASS user — see [below](#running-without-an-admin-token). |
+
+### Running without an admin token
+
+OpenCTI only serves its **generic** live stream to users with `BYPASS`. Any
+other token is refused (`Consume generic stream is only authorized for bypass
+user`), the stream never connects, and the service falls back to slow live
+queries. Rather than hand the middleware an admin-equivalent token, give it a
+**named** live stream. Verified on OpenCTI 7.26:
+
+1. **Role** with three capabilities:
+   - `Access knowledge` (`KNOWLEDGE`)
+   - `Allow token usage` (`APIACCESS_USETOKEN`)
+   - `Access data sharing` (`TAXIIAPI`). Without it, even a stream the group is authorized on returns 401.
+2. **Group** with that role, and **allowed markings that cover your intel**.
+   This one fails silently: a group with no allowed markings only sees
+   unmarked data. On the test instance that was 59 observables out of 19,641,
+   with no error anywhere. Compare `membership_packed` in `/readyz` against
+   what you expect.
+3. **Service user** in that group, with an API token for `OPENCTI_TOKEN`.
+4. **Live stream** under *Data → Data sharing → Live streams*:
+   - Filter: *Entity type = Indicator*.
+   - Authorized members: the group.
+   - Start the stream.
+
+   Keep the filter to the entity type. Indicator events carry their
+   observable values inline, which is all the consumer needs. A narrower
+   filter (score, labels) would make the stream disagree with the bootstrap,
+   which loads every observable the token can see.
+5. Set `OPENCTI_STREAM_ID` to the stream's ID and restart.
+
+`/readyz` should then show `stream: connected`. If OpenCTI refuses the stream,
+`stream_error` carries OpenCTI's own reason.
 
 ---
 
@@ -415,6 +448,9 @@ A few settings are worth understanding before you tune anything:
 |---|---|
 | `/readyz` stays false | Bootstrap is still running — normal on a large corpus. Check the logs for `membership.load_failed`. |
 | Everything returns `found: false` | Check `/config/validate`. Usually a bad `OPENCTI_TOKEN` or an unreachable `OPENCTI_URL`. |
+| `stream_error: refused: HTTP 401 Consume generic stream is only authorized for bypass user` | The token isn't a BYPASS user. Set `OPENCTI_STREAM_ID` — see [Running without an admin token](#running-without-an-admin-token). |
+| `stream_error: refused: HTTP 401 You are not authorized…` with `OPENCTI_STREAM_ID` set | The token's group isn't an authorized member of that stream, the role lacks `Access data sharing`, or the ID is wrong. |
+| `membership_packed` far below your corpus | The token's group can't see most of it: give the group allowed markings that cover your intel. |
 | Responses carry `degraded: "true"` | OpenCTI is unreachable or the circuit breaker is open. Misses are still correct; hits just aren't enriched. |
 | Graylog adapter shows errors | Something is returning non-2xx. A miss should be a 200 — check the API key header. |
 | Graylog lookups all miss, but `curl` works | The pipeline rule is concatenating something onto the key. Pass the indicator alone; put tenant tags in an HTTP header. |

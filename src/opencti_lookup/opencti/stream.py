@@ -63,6 +63,29 @@ HEARTBEAT_EVENTS: frozenset[str] = frozenset({"heartbeat"})
 METRICS_EVENTS: frozenset[str] = frozenset({"consumer_metrics"})
 
 
+#: Logged when OpenCTI refuses the generic stream -- its own message ("only
+#: authorized for bypass user") doesn't say what to do about it.
+GENERIC_STREAM_HINT = (
+    "OpenCTI only serves the generic /stream to BYPASS users; set "
+    "OPENCTI_STREAM_ID to a live stream this token's group can read"
+)
+
+
+class StreamRefusedError(RuntimeError):
+    """OpenCTI answered the stream request with something other than 200."""
+
+
+def refusal_hint(url: str, exc: BaseException) -> str | None:
+    """What to tell the operator when a connection attempt fails.
+
+    Only a refusal of the *generic* stream points at OPENCTI_STREAM_ID; a
+    named stream refusing is a sharing or capability problem instead.
+    """
+    if isinstance(exc, StreamRefusedError) and url.rstrip("/").endswith("/stream"):
+        return GENERIC_STREAM_HINT
+    return None
+
+
 @dataclass
 class StreamStats:
     connected: bool = False
@@ -173,11 +196,13 @@ class StreamConsumer:
                 # Jitter so N workers do not reconnect in lockstep and
                 # thunder against OpenCTI after a restart.
                 delay = min(backoff, 60.0) * (0.5 + random.random())  # noqa: S311
+                hint = refusal_hint(self._url, exc)
                 log.warning(
                     "stream.reconnecting",
                     error=self.stats.last_error,
                     delay_s=round(delay, 1),
                     cursor=self._cursor,
+                    **({"hint": hint} if hint else {}),
                 )
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._stop.wait(), timeout=delay)
@@ -198,6 +223,16 @@ class StreamConsumer:
                 client, "GET", self._url, params=params, headers=headers
             ) as source,
         ):
+            # Check before claiming "connected". OpenCTI refuses with a 401
+            # and puts the reason in the status line -- e.g. "Consume generic
+            # stream is only authorized for bypass user" -- with an empty body
+            # and no content type, which httpx_sse would otherwise report only
+            # as a content-type mismatch.
+            response = source.response
+            if response.status_code != 200:
+                raise StreamRefusedError(
+                    f"refused: HTTP {response.status_code} {response.reason_phrase}"
+                )
             self.stats.connected = True
             self.stats.last_error = None
             log.info("stream.connected", url=self._url, cursor=self._cursor)

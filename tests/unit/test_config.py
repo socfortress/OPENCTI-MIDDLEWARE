@@ -87,3 +87,45 @@ def test_read_timeout_must_fit_inside_the_request_budget(tmp_path: pathlib.Path)
     )
     with pytest.raises(ValueError, match="request_budget_ms"):
         Settings(_env_file=env)  # type: ignore[call-arg]
+
+
+def test_stream_url_defaults_to_the_generic_stream(tmp_path: pathlib.Path) -> None:
+    env = _write_env(
+        tmp_path,
+        "API_KEY=" + "k" * 32 + "\n"
+        "OPENCTI_URL=https://opencti.example.com\n"
+        "OPENCTI_TOKEN=token\n"
+        # Present but empty, as in a copied .env.example: still generic.
+        "OPENCTI_STREAM_ID=\n",
+    )
+    settings = Settings(_env_file=env)  # type: ignore[call-arg]
+    assert settings.opencti_stream_id is None
+    assert settings.stream_url == f"{settings.opencti_url}/stream"
+
+
+def test_stream_id_selects_a_named_live_stream(tmp_path: pathlib.Path) -> None:
+    """The generic stream is BYPASS-only; a named one lets a least-privilege
+    token keep real-time membership (issue #2)."""
+    stream_id = "4b6e5a3c-1d2f-4e8a-9b7c-0d1e2f3a4b5c"
+    env = _write_env(
+        tmp_path,
+        "API_KEY=" + "k" * 32 + "\n"
+        "OPENCTI_URL=https://opencti.example.com\n"
+        "OPENCTI_TOKEN=token\n"
+        f"OPENCTI_STREAM_ID= {stream_id} \n",
+    )
+    settings = Settings(_env_file=env)  # type: ignore[call-arg]
+    assert settings.stream_url == f"{settings.opencti_url}/stream/{stream_id}"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "https://opencti.example.com/stream/4b6e5a3c",
+        "../graphql",
+        "4b6e5a3c?from=0",
+    ],
+)
+def test_stream_id_must_be_an_id_not_a_url(settings: Settings, bad: str) -> None:
+    with pytest.raises(ValueError, match="live stream's ID"):
+        Settings(**{**settings.model_dump(), "opencti_stream_id": bad})

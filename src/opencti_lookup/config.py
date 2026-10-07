@@ -7,6 +7,7 @@ the way the app this replaces did.
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from functools import lru_cache
 from typing import Annotated, Literal
@@ -67,6 +68,11 @@ class Settings(BaseSettings):
     opencti_timeout_read_ms: int = 1500
     opencti_max_connections: int = 50
     opencti_max_concurrency: int = 20
+    # Named live stream to consume instead of the generic /stream. OpenCTI
+    # only lets BYPASS users read the generic one, so a least-privilege token
+    # needs a live stream filtered to Indicators and shared with its group.
+    # Unset -> the generic stream.
+    opencti_stream_id: str | None = None
 
     # -------------------------------------------------------------- backend
     membership_mode: Literal["auto", "always", "off"] = "auto"
@@ -142,6 +148,24 @@ class Settings(BaseSettings):
             raise ValueError("must start with http:// or https://")
         return v
 
+    @field_validator("opencti_stream_id", mode="before")
+    @classmethod
+    def _stream_id(cls, v: object) -> object:
+        """Empty means the generic stream. The ID becomes a URL path segment,
+        so allow only what one can contain -- a pasted URL fails here, at
+        boot, rather than as a 404 on every reconnect."""
+        if v is None:
+            return None
+        v = str(v).strip()
+        if not v:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9-]+", v):
+            raise ValueError(
+                "must be the live stream's ID (Data > Data sharing > Live "
+                "streams), not a URL"
+            )
+        return v
+
     @field_validator("skip_tlds", mode="before")
     @classmethod
     def _split_csv_lower(cls, v: object) -> object:
@@ -204,6 +228,8 @@ class Settings(BaseSettings):
 
     @property
     def stream_url(self) -> str:
+        if self.opencti_stream_id:
+            return f"{self.opencti_url}/stream/{self.opencti_stream_id}"
         return f"{self.opencti_url}/stream"
 
     def query_types_for(self, indicator_type: str) -> tuple[str, ...]:
