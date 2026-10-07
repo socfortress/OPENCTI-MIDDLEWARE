@@ -66,3 +66,11 @@ async def test_skipped_values_short_circuit(backend: SplitBackend) -> None:
     result = await backend.lookup(normalize("10.0.0.1"))
     assert result.source == "skip"
     assert result.payload == {"found": "false"}
+
+
+def test_describe_reports_split_not_live(backend: SplitBackend) -> None:
+    """The live backend's fields are merged in; its "backend": "live" must
+    not overwrite ours, or /readyz claims live-only while split is serving."""
+    info = backend.describe()
+    assert info["backend"] == "split"
+    assert info["breaker"] == "closed"  # live's fields are still there
