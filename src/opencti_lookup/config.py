@@ -94,6 +94,11 @@ class Settings(BaseSettings):
     membership_state_dir: str = ""          # "" -> /dev/shm or the temp dir
     membership_attach_timeout_s: int = 300  # must exceed bootstrap time
     membership_attach_retry_s: int = 30     # background re-attach after a timeout
+    # First load failed (OpenCTI not answering at boot, e.g. both came up
+    # together after a reboot). Retry with exponential backoff between these
+    # two delays; until it succeeds lookups go live and /readyz reports 503.
+    membership_bootstrap_retry_s: float = Field(5.0, gt=0.0)
+    membership_bootstrap_retry_max_s: float = Field(300.0, gt=0.0)
 
     # --------------------------------------------------------- memory budget
     mirror_max_memory_mb: int | Literal["auto"] = "auto"

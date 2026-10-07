@@ -134,7 +134,9 @@ async def load(
             return await _build_and_publish(
                 client, settings, state_dir, max_entries=max_entries
             )
-        except Exception:
+        except BaseException:
+            # BaseException so a shutdown that cancels a background retry
+            # mid-build does not leave the lock held.
             state_dir.release_builder()
             raise
 
