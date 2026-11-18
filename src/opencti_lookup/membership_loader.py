@@ -78,13 +78,26 @@ async def _build_and_publish(
 
 
 def _attach(state: SharedMembershipState, settings: Settings) -> MembershipSet | None:
-    try:
-        membership = MembershipSet.attach(
-            state.shm_name, state.count, overlay_max=settings.membership_overlay_max
+    if state.count == 0:
+        # An empty corpus -- a fresh OpenCTI, before any connector has
+        # imported -- is published without a segment: SharedMemory cannot be
+        # zero bytes, so the builder never creates the name it records. Map
+        # nothing and take the empty set it describes. Trying the name would
+        # fail on every retry and leave this worker unready until the next
+        # non-empty rebuild, up to MEMBERSHIP_RECONCILE_INTERVAL_S later.
+        membership = MembershipSet(
+            None, 0, owner=False, overlay_max=settings.membership_overlay_max
         )
-    except (FileNotFoundError, OSError) as exc:
-        log.warning("membership.attach_failed", shm_name=state.shm_name, error=str(exc))
-        return None
+    else:
+        try:
+            membership = MembershipSet.attach(
+                state.shm_name, state.count, overlay_max=settings.membership_overlay_max
+            )
+        except (FileNotFoundError, OSError) as exc:
+            log.warning(
+                "membership.attach_failed", shm_name=state.shm_name, error=str(exc)
+            )
+            return None
     log.info(
         "membership.attached",
         shm_name=state.shm_name,
