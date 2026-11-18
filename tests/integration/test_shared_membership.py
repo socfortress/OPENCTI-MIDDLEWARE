@@ -7,6 +7,8 @@ a segment when a *reader* exits.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import subprocess
 import sys
 import tempfile
@@ -21,6 +23,8 @@ from opencti_lookup.backends.shared_state import (
     SharedStateDir,
     segment_name,
 )
+from opencti_lookup.config import Settings
+from opencti_lookup.membership_loader import _attach, watch_for_new_generation
 
 SRC = str(Path(__file__).resolve().parents[2] / "src")
 
@@ -208,3 +212,62 @@ def test_sweep_never_removes_a_kept_segment() -> None:
         live.close()
         with pytest.raises(FileNotFoundError):
             MembershipSet.attach(segment_name(7002), 1)
+
+
+def _publish_empty_build(state_dir: SharedStateDir, generation: int) -> None:
+    """Publish what the builder publishes for an empty corpus: the segment
+    name it would have used, with no segment behind it."""
+    built = MembershipSet.build([], name=segment_name(generation))
+    assert built.shm_name is None  # SharedMemory cannot be zero bytes
+    state_dir.publish(
+        SharedMembershipState(
+            built.shm_name or segment_name(generation), 0, generation, time.time(), 0
+        )
+    )
+
+
+def test_reader_attaches_to_an_empty_corpus(
+    state_dir: SharedStateDir, settings: Settings
+) -> None:
+    """A fresh OpenCTI has nothing to load when the middleware first starts.
+    Readers used to retry mapping the recorded, never-created segment until
+    the next non-empty rebuild (a day by default), staying unready."""
+    _publish_empty_build(state_dir, generation=8101)
+    state = state_dir.read()
+    assert state is not None
+
+    membership = _attach(state, settings)
+
+    assert membership is not None
+    assert len(membership) == 0
+    assert "anything.example.com" not in membership
+    # The stream keeps an attached reader current through its overlay
+    membership.add("new.example.com")
+    assert "new.example.com" in membership
+    membership.close()
+
+
+async def test_watcher_adopts_an_empty_generation(
+    state_dir: SharedStateDir, settings: Settings
+) -> None:
+    """The stuck case seen in the field: a reader that found the empty build
+    at startup must adopt it on its next background retry."""
+    _publish_empty_build(state_dir, generation=1)
+    adopted: list[MembershipSet] = []
+    fast = settings.model_copy(update={"membership_attach_retry_s": 0})
+
+    watcher = asyncio.create_task(
+        watch_for_new_generation(state_dir, fast, adopted.append, current_generation=0)
+    )
+    try:
+        for _ in range(200):
+            if adopted:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
+
+    assert len(adopted) == 1
+    assert len(adopted[0]) == 0
